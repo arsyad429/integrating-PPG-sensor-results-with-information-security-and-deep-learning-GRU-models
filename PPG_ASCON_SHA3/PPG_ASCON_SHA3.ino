@@ -10,8 +10,8 @@
 #include <SHA3.h> 
 
 // --- Konfigurasi Jaringan & MQTT ---
-const char* ssid = "SamsungS23FE";       
-const char* password = "spectercantik";
+const char* ssid = "ssidWIFI";       
+const char* password = "password";
 const char* mqtt_server = "broker.hivemq.com";
 const int mqtt_port = 1883;
 const char* mqtt_topic = "arsyad/brawijaya_med/secure_ppg"; 

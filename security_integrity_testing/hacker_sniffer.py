@@ -5,7 +5,7 @@ TOPIC_NON_SECURE = "arsyad/brawijaya_med/ppg_sensor_01"
 TOPIC_SECURE = "arsyad/brawijaya_med/secure_ppg"
 
 def on_message(client, userdata, msg):
-    print(f"\n[🚨 SNIFFER MENANGKAP PAKET DARI {msg.topic}]")
+    print(f"\n[SNIFFER MENANGKAP PAKET DARI {msg.topic}]")
     print(f"Isi Payload: {msg.payload.decode('utf-8')}")
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)

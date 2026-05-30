@@ -5,6 +5,7 @@ import time
 from collections import deque
 import pandas as pd
 import plotly.express as px
+import os
 
 # --- Konfigurasi Halaman ---
 st.set_page_config(page_title="Real-Time PPG Dashboard", layout="wide")
@@ -42,7 +43,12 @@ data_store = get_data_store()
 # Fungsi Pemicu Ekspor ke Excel
 def trigger_excel_export():
     if len(data_store.export_buffer) > 0:
-        filename = f"ppg_sensor_{data_store.export_counter}.xlsx"
+        # Buat folder khusus agar rapi
+        folder_path = "captured_data/base_version"
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        filename = f"{folder_path}/ppg_sensor_{data_store.export_counter}.xlsx"
         df = pd.DataFrame(data_store.export_buffer)
         try:
             df.to_excel(filename, index=False)
@@ -58,7 +64,7 @@ def trigger_excel_export():
 # --- Konfigurasi MQTT ---
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
-MQTT_TOPIC = "arsyad/brawijaya_med/ppg_sensor_01" 
+MQTT_TOPIC = "ppg_sensor_01" 
 
 def on_connect(client, userdata, flags, rc, *args):
     print(f"\n[STATUS MQTT] Terhubung ke Broker dengan kode: {rc}")
@@ -80,14 +86,17 @@ def on_message(client, userdata, msg):
         raw_ppg = payload.get("ppg", 0)
         status_val = payload.get("status", "Unknown")
 
-        # --- LOGIKA PENYIMPANAN DATA EXCEL (YANG DIPERBAIKI) ---
+        # --- TANGKAP DATA CPU & MEMORY ---
+        cpu_val = payload.get("cpu", 0.0)
+        mem_val = payload.get("mem", 0.0)
+
+        # --- LOGIKA PENYIMPANAN DATA EXCEL ---
         finger_detected_now = (raw_ppg > 50000)
 
         # 1. Deteksi momen persis ketika jari BARU SAJA diletakkan
         if finger_detected_now and not data_store.is_finger_currently_detected:
-            # Reset stopwatch ke detik ini juga!
             data_store.last_export_time = time.time()
-            data_store.export_buffer.clear() # Pastikan keranjang kosong
+            data_store.export_buffer.clear() 
 
         # 2. Kondisi saat jari sedang menempel
         if finger_detected_now:
@@ -103,23 +112,26 @@ def on_message(client, userdata, msg):
                     "BPM": bpm_val,
                     "IBI_ms": ibi_val,
                     "HRV_SDNN_ms": round(hrv_val, 2),
-                    "Sensor_Status": status_val
+                    "Sensor_Status": status_val,
+                    "CPU_Load_%": round(cpu_val, 2),     # <-- TERSIMPAN
+                    "Memory_Used_%": round(mem_val, 2),  # <-- TERSIMPAN
+                    "Latency_ms": latency                # <-- TERSIMPAN
                 })
 
-            # Ekspor berkala HANYA JIKA benar-benar sudah lewat 30 detik sejak jari nempel
+            # # Ekspor berkala setiap 30 detik
             # if (time.time() - data_store.last_export_time) >= 30.0:
             #     trigger_excel_export()
 
-        # 3. Kondisi saat jari tidak ada (atau baru saja dilepas)
+        # 3. Kondisi saat jari dilepas
         else:
             filtered_ppg = 0
             data_store.w = 0.0 
             
-            # Deteksi momen persis ketika jari BARU SAJA DILEPAS sebelum 30 detik
+            # # Ekspor sisa data di buffer saat jari dilepas
             # if data_store.is_finger_currently_detected:
             #     trigger_excel_export()
 
-        # Update status jari saat ini untuk iterasi berikutnya (Sangat Penting!)
+        # Update status jari saat ini
         data_store.is_finger_currently_detected = finger_detected_now
 
         # --- Update data grafik & memori UI ---
@@ -129,8 +141,8 @@ def on_message(client, userdata, msg):
 
         data_store.latest_data.update({
             "bpm": bpm_val, "ibi": ibi_val, "hrv": hrv_val,
-            "status": status_val, "cpu": payload.get("cpu", 0.0),
-            "mem": payload.get("mem", 0.0), "latency": latency
+            "status": status_val, "cpu": cpu_val,
+            "mem": mem_val, "latency": latency
         })
 
     except Exception as e:

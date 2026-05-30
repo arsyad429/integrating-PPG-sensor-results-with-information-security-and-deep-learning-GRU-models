@@ -10,7 +10,7 @@ import os
 
 # --- Konfigurasi Halaman ---
 st.set_page_config(page_title="Secure PPG ASCON", layout="wide")
-st.title("🔒 Secure Real-Time PPG Monitor & Data Logger")
+st.title("🔒 Secure Real-Time PPG Monitor (ASCON-128 Only)")
 
 SECRET_KEY = bytes([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F])
 
@@ -29,7 +29,7 @@ class SensorData:
 
         # --- Variabel Khusus Excel Export ---
         self.export_buffer = []
-        self.export_counter = 20
+        self.export_counter = 1
         self.last_export_time = time.time()
         self.is_finger_currently_detected = False
 
@@ -51,15 +51,14 @@ def trigger_excel_export():
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
-
         filename = f"{folder_path}/ppg_sensor_ascon_{data_store.export_counter}.xlsx"
         df = pd.DataFrame(data_store.export_buffer)
         try:
             df.to_excel(filename, index=False)
-            print(f"EXCEL SUCCESS: {len(df)} baris data diekspor ke {filename}")
+            print(f"✅ EXCEL SUCCESS: {len(df)} baris data diekspor ke {filename}")
             data_store.export_counter += 1
         except Exception as e:
-            print(f"EXCEL ERROR: {e}")
+            print(f"❌ EXCEL ERROR: {e}")
         
         data_store.export_buffer.clear()
         data_store.last_export_time = time.time()
@@ -67,7 +66,7 @@ def trigger_excel_export():
 # --- Konfigurasi MQTT ---
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
-MQTT_TOPIC = "arsyad/brawijaya_med/secure_ppg" 
+MQTT_TOPIC = "secure_ppg" 
 
 def on_connect(client, userdata, flags, rc, *args):
     print(f"\n[STATUS MQTT] Terhubung dengan kode: {rc}")
@@ -81,9 +80,16 @@ def on_message(client, userdata, msg):
         esp_ts = payload.get("ts", current_time_ms)
         latency = abs(current_time_ms - esp_ts) 
 
+        # Ambil data Telemetri dari luar payload terenkripsi
+        cpu_val = payload.get("cpu", 0.0)
+        mem_val = payload.get("mem", 0.0)
+        enc_t_val = payload.get("enc_t", 0)
+        enc_o_val = payload.get("enc_o", 0)
+
         nonce_bytes = bytes.fromhex(payload.get("nonce", "00"*16))
         ct_bytes = bytes.fromhex(payload.get("ct", ""))
         
+        # Dekripsi ASCON
         start_dec = time.perf_counter()
         plaintext_bytes = ascon.decrypt(SECRET_KEY, nonce_bytes, b"", ct_bytes, variant="Ascon-128")
         dec_time_ms = (time.perf_counter() - start_dec) * 1000 
@@ -96,7 +102,7 @@ def on_message(client, userdata, msg):
         raw_ppg = medical_data.get("ppg", 0)
         status_val = medical_data.get("status", "Unknown")
 
-        # --- LOGIKA PENYIMPANAN DATA EXCEL (Edge Detection) ---
+        # --- LOGIKA PENYIMPANAN DATA EXCEL ---
         finger_detected_now = (raw_ppg > 50000)
 
         # 1. Jari baru ditempelkan
@@ -117,19 +123,24 @@ def on_message(client, userdata, msg):
                     "BPM": bpm_val,
                     "IBI_ms": ibi_val,
                     "HRV_SDNN_ms": round(hrv_val, 2),
-                    "Sensor_Status": status_val
+                    "Sensor_Status": status_val,
+                    "CPU_Load_%": round(cpu_val, 2),
+                    "Memory_Used_%": round(mem_val, 2),
+                    "Latency_ms": latency,
+                    "Enc_Time_us": enc_t_val,
+                    "Dec_Time_ms": round(dec_time_ms, 3)
                 })
 
-            # if (time.time() - data_store.last_export_time) >= 30.0:
-            #     trigger_excel_export()
+            if (time.time() - data_store.last_export_time) >= 30.0:
+                trigger_excel_export()
 
         # 3. Jari dilepas
         else:
             filtered_ppg = 0
             data_store.w = 0.0 
             
-            # if data_store.is_finger_currently_detected:
-            #     trigger_excel_export()
+            if data_store.is_finger_currently_detected:
+                trigger_excel_export()
 
         data_store.is_finger_currently_detected = finger_detected_now
 
@@ -139,16 +150,16 @@ def on_message(client, userdata, msg):
 
         data_store.latest_data.update({
             "bpm": bpm_val, "ibi": ibi_val, "hrv": hrv_val,
-            "status": status_val, "cpu": payload.get("cpu", 0.0),
-            "mem": payload.get("mem", 0.0), "latency": latency,
-            "enc_t": payload.get("enc_t", 0), "enc_o": payload.get("enc_o", 0),
+            "status": status_val, "cpu": cpu_val,
+            "mem": mem_val, "latency": latency,
+            "enc_t": enc_t_val, "enc_o": enc_o_val,
             "dec_t": dec_time_ms
         })
 
     except ValueError:
-        print("INTEGRITAS GAGAL (Kunci salah/MITM)")
+        print("❌ INTEGRITAS GAGAL (Kunci salah/MITM)")
     except Exception as e:
-        pass
+        print(f"❌ Error memproses data: {e}")
 
 @st.cache_resource
 def init_mqtt():
@@ -166,13 +177,11 @@ mqtt_client = init_mqtt()
 
 # --- Layout UI Medis ---
 st.markdown("### 🩺 Vital Signs & Advanced Analytics")
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4) # <-- Diubah menjadi 4 kolom
 bpm_placeholder = col1.empty()
 ibi_placeholder = col2.empty()
 hrv_placeholder = col3.empty()
-
-st.markdown("<br>", unsafe_allow_html=True)
-status_placeholder = st.empty()
+status_placeholder = col4.empty()
 
 st.markdown("---")
 st.markdown("### 🛡️ Evaluasi Keamanan Jaringan & Sistem (ASCON-128)")
@@ -208,7 +217,7 @@ try:
         
         status_color = "green" if "Good" in data['status'] else "red"
         status_placeholder.markdown(
-            f"**🫀 Sensor Status:** <span style='color:{status_color}; font-size:20px'>{data['status']}</span>", 
+            f"**🫀 Sensor Status:** <br><span style='color:{status_color}; font-size:24px'>{data['status']}</span>", 
             unsafe_allow_html=True
         )
 

@@ -13,7 +13,7 @@ const char* ssid = "";
 const char* password = "";
 const char* mqtt_server = "broker.hivemq.com";
 const int mqtt_port = 1883;
-const char* mqtt_topic = "arsyad/brawijaya_med/secure_ppg"; 
+const char* mqtt_topic = "secure_ppg"; 
 const char* ntpServer = "pool.ntp.org";
 
 WiFiClient espClient;

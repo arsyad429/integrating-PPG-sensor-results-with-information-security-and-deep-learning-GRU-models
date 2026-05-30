@@ -10,11 +10,11 @@
 #include <SHA3.h> 
 
 // --- Konfigurasi Jaringan & MQTT ---
-const char* ssid = "ssidWIFI";       
-const char* password = "password";
+const char* ssid = "";       
+const char* password = "";
 const char* mqtt_server = "broker.hivemq.com";
 const int mqtt_port = 1883;
-const char* mqtt_topic = "arsyad/brawijaya_med/secure_ppg"; 
+const char* mqtt_topic = "secure_ppg"; 
 const char* ntpServer = "pool.ntp.org";
 
 WiFiClient espClient;
@@ -216,6 +216,17 @@ void loop() {
     char jsonBuffer[512];
     serializeJson(secureDoc, jsonBuffer);
     client.publish(mqtt_topic, jsonBuffer);
+    
+    Serial.printf("Vital  : BPM=%d | IBI=%dms | HRV=%.1fms | %s\n", 
+                  beatAvg, ibi, hrv_sdnn, sensorStatus.c_str());
+                  
+    // Print Status Keamanan (ASCON + SHA3)
+    String hashString = toHex(sha3Hash, 32);
+    Serial.printf("ASCON  : Waktu Enkripsi = %lu us | Overhead = %d Bytes\n", 
+                  encryptionTime, encryptionOverhead);
+    Serial.printf("SHA-3  : %s...\n", hashString.substring(0, 16).c_str()); // Tampilkan 16 huruf awal saja
+    Serial.printf("Sistem : CPU Load = %.1f%% | Memori = %.1f%%\n", 
+                  realCpuLoad, memoryUsagePercent);
   }
 
   delay(10); 

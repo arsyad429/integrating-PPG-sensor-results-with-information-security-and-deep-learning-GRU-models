@@ -1,7 +1,6 @@
 // ============================================================
-//  PPG_SHA3.ino  —  Level 8: Integrity Implementation
-//  Mengganti ASCON Encryption → SHA3-256 Hashing
-//  Data ECG dikirim plaintext + hash SHA3 untuk verifikasi integritas
+//  PPG_SHA3_ML.ino  —  Level 8 + Machine Learning
+//  Kombinasi Integritas SHA3-256 dan Klasifikasi TFLite (GRU)
 // ============================================================
 
 #include <WiFi.h>
@@ -13,6 +12,14 @@
 #include "heartRate.h"
 #include <Crypto.h>
 #include <SHA3.h>
+
+// --- PUSTAKA TENSORFLOW LITE ---
+#include <TensorFlowLite_ESP32.h>
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "model_data.h" 
 
 // --- Konfigurasi Jaringan & MQTT ---
 const char* ssid         = "";
@@ -45,11 +52,29 @@ float hrv_sdnn = 0.0;
 unsigned long lastPublishTime = 0;
 const int PUBLISH_INTERVAL    = 200;
 
+// =========================================================
+// VARIABEL GLOBAL TENSORFLOW LITE
+// =========================================================
+const tflite::Model* tfliteModel = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+tflite::MicroErrorReporter micro_error_reporter;
+tflite::ErrorReporter* error_reporter = &micro_error_reporter;
+
+// Menggunakan 128KB untuk mencegah "Failed to allocate memory"
+constexpr int kTensorArenaSize = 128 * 1024; 
+uint8_t tensor_arena[kTensorArenaSize];
+
+// Buffer untuk menampung input 20 timestep x 3 fitur (60 float)
+float input_buffer[60];
+int data_index = 0;
+
+// Variabel penyimpan hasil prediksi
+String current_diagnosis = "Waiting for finger...";
+
 // ============================================================
-//  FUNGSI HELPER
+//  FUNGSI HELPER & SHA3-256 HASHING
 // ============================================================
 
-// Konversi byte array → hex string (sama seperti sebelumnya)
 String toHex(byte* data, int len) {
   String hexStr = "";
   for (int i = 0; i < len; i++) {
@@ -59,29 +84,19 @@ String toHex(byte* data, int len) {
   return hexStr;
 }
 
-// ============================================================
-//  FUNGSI SHA3-256 HASHING  <-- BARU, pengganti ASCON encrypt
-//  Input  : string data yang mau di-hash
-//  Output : hex string 64 karakter (256 bit / 32 byte)
-// ============================================================
-// Buat objek SHA3-256 (Kamu juga bisa pakai SHA3_512 jika butuh yang 512-bit)
 SHA3_256 sha3;
 
 String hitungSHA3String(String input) {
-  byte hash[32]; // SHA3-256 menghasilkan 32 byte
-  
-  // Proses Hashing
+  byte hash[32]; 
   sha3.reset();
   sha3.update((const uint8_t*)input.c_str(), input.length());
   sha3.finalize(hash, sizeof(hash));
   
-  // Ubah hasil byte menjadi teks Hexadecimal agar mudah dibaca
   String hashHex = "";
   for (int i = 0; i < sizeof(hash); i++) {
     if (hash[i] < 0x10) hashHex += "0";
     hashHex += String(hash[i], HEX);
   }
-  
   return hashHex;
 }
 
@@ -100,7 +115,7 @@ void setup_wifi() {
 
 void reconnect() {
   while (!client.connected()) {
-    String clientId = "ESP32S3-SHA3-";
+    String clientId = "ESP32S3-SHA3-ML-";
     clientId += String(random(0, 1000));
     if (client.connect(clientId.c_str())) { }
     else { delay(5000); }
@@ -124,7 +139,25 @@ void setup() {
 
   setup_wifi();
   client.setServer(mqtt_server, mqtt_port);
-  client.setBufferSize(600); // sedikit lebih besar karena ada field hash (64 char)
+  client.setBufferSize(1024); // Diperbesar menjadi 1KB agar aman menampung Hash + Prediksi
+
+  // --- INISIALISASI TENSORFLOW LITE ---
+  tfliteModel = tflite::GetModel(model_tflite);
+  if (tfliteModel->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.println("ERROR: Skema TFLite tidak cocok!");
+    while (true);
+  }
+
+  static tflite::AllOpsResolver resolver;
+  static tflite::MicroInterpreter static_interpreter(
+      tfliteModel, resolver, tensor_arena, kTensorArenaSize, error_reporter);
+  interpreter = &static_interpreter;
+
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("ERROR: Gagal mengalokasikan memori Tensor Arena!");
+    while (true);
+  }
+  Serial.println("✅ TFLite Model berhasil dimuat!");
 }
 
 // ============================================================
@@ -137,9 +170,12 @@ void loop() {
   long irValue = particleSensor.getIR();
   String sensorStatus = "Good (100%)";
 
+  // --- CEK JARI & KALKULASI DATA VITAL ---
   if (irValue < 50000) {
     sensorStatus = "No Finger Detected";
     beatAvg = 0; ibi = 0; hrv_sdnn = 0.0;
+    current_diagnosis = "Waiting for finger...";
+    data_index = 0; 
   } else {
     if (checkForBeat(irValue) == true) {
       unsigned long currentTime = millis();
@@ -155,7 +191,7 @@ void loop() {
         for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
         beatAvg /= RATE_SIZE;
 
-        // Kalkulasi HRV (SDNN) — sama seperti sebelumnya
+        // Kalkulasi HRV (SDNN)
         ibi_array[ibi_spot++] = ibi;
         ibi_spot %= HRV_SIZE;
 
@@ -175,15 +211,63 @@ void loop() {
     }
   }
 
-  // Kalkulasi CPU Riil
   unsigned long processingTime = micros() - loopStartMicros;
   float realCpuLoad = ((float)processingTime / (processingTime + 10000.0)) * 100.0;
 
+  // --- BLOK PUBLISH MQTT, INFERENSI ML & SHA3 (Setiap 200ms) ---
   if (millis() - lastPublishTime >= PUBLISH_INTERVAL) {
     lastPublishTime = millis();
 
-    Serial.printf("BPM: %d | IBI: %d ms | HRV: %.1f ms | CPU: %.1f%% | IR: %ld\n",
-                  beatAvg, ibi, hrv_sdnn, realCpuLoad, irValue);
+    // 1. PENGUMPULAN DATA & INFERENSI ML 
+    if (irValue > 50000) {
+      float mean_f1 = 0.7769376f;   float scale_f1 = 0.20464825f;
+      float mean_f2 = 82.99367422f; float scale_f2 = 23.88029078f;
+      float mean_f3 = 0.09135964f;  float scale_f3 = 0.08498789f;
+      
+      float feature1_raw = (float)ibi / 1000.0;     
+      float feature2_raw = (float)beatAvg;          
+      float feature3_raw = hrv_sdnn / 1000.0;       
+
+      float feature1 = (feature1_raw - mean_f1) / scale_f1; 
+      float feature2 = (feature2_raw - mean_f2) / scale_f2;   
+      float feature3 = (feature3_raw - mean_f3) / scale_f3;      
+
+      if (data_index < 20) {
+        input_buffer[data_index * 3 + 0] = feature1;
+        input_buffer[data_index * 3 + 1] = feature2;
+        input_buffer[data_index * 3 + 2] = feature3;
+        data_index++;
+        
+        if (data_index < 20) {
+           current_diagnosis = "Mengumpulkan Data (" + String(data_index) + "/20)...";
+        }
+      }
+
+      if (data_index == 20) {
+        TfLiteTensor* input = interpreter->input(0);
+        for(int i = 0; i < 60; i++) {
+          input->data.f[i] = input_buffer[i];
+        }
+
+        if (interpreter->Invoke() == kTfLiteOk) {
+          TfLiteTensor* output = interpreter->output(0);
+          
+          float p_normal      = output->data.f[0];
+          float p_arrhythmia  = output->data.f[1];
+          float p_tachycardia = output->data.f[2];
+          float p_bradycardia = output->data.f[3];
+
+          float max_prob = p_normal; 
+          current_diagnosis = "Normal";
+
+          if(p_arrhythmia > max_prob)  { max_prob = p_arrhythmia;  current_diagnosis = "Arrhythmia"; }
+          if(p_tachycardia > max_prob) { max_prob = p_tachycardia; current_diagnosis = "Tachycardia"; }
+          if(p_bradycardia > max_prob) { max_prob = p_bradycardia; current_diagnosis = "Bradycardia"; }
+
+        } 
+        data_index = 0; 
+      }
+    }
 
     uint32_t freeHeap  = ESP.getFreeHeap();
     uint32_t totalHeap = ESP.getHeapSize();
@@ -196,51 +280,52 @@ void loop() {
       (unsigned long long)(tv.tv_usec) / 1000ULL;
 
     // -------------------------------------------------------
-    //  STEP 1: Buat JSON data PPG (plaintext, tidak disembunyikan)
+    //  STEP 2: Buat JSON data PPG untuk di-Hash 
+    //  (Diagnosis ML sekarang ikut diamankan oleh Hash!)
     // -------------------------------------------------------
-    StaticJsonDocument<256> plainDoc;
+    StaticJsonDocument<384> plainDoc;
     plainDoc["ppg"]    = irValue;
     plainDoc["bpm"]    = beatAvg;
     plainDoc["ibi"]    = ibi;
     plainDoc["hrv"]    = hrv_sdnn;
     plainDoc["status"] = sensorStatus;
+    plainDoc["ml_class"] = current_diagnosis; // Melindungi Data Prediksi ML
 
     String plainTextStr;
     serializeJson(plainDoc, plainTextStr);
 
     // -------------------------------------------------------
-    //  STEP 2: Hitung SHA3-256 dari data PPG
-    //  Ukur waktu hashing (dalam mikrodetik) untuk evaluasi Level 9
+    //  STEP 3: Hashing SHA3-256
     // -------------------------------------------------------
     unsigned long startHash = micros();
     String hashResult = hitungSHA3String(plainTextStr);
-    unsigned long endHash = micros();
-
-    unsigned long hashingTime = endHash - startHash; // dalam mikrodetik
+    unsigned long hashingTime = micros() - startHash; 
 
     // -------------------------------------------------------
-    //  STEP 3: Kirim payload = data asli + hash + metadata
-    //  (berbeda dengan ASCON yang kirim ciphertext)
+    //  STEP 4: Kirim payload final
     // -------------------------------------------------------
-    StaticJsonDocument<512> secureDoc;
-    secureDoc["ppg"]              = irValue;       // data asli (terbaca)
+    StaticJsonDocument<768> secureDoc;
+    secureDoc["ppg"]              = irValue;       
     secureDoc["bpm"]              = beatAvg;
     secureDoc["ibi"]              = ibi;
     secureDoc["hrv"]              = hrv_sdnn;
     secureDoc["status"]           = sensorStatus;
-    secureDoc["hash"]             = hashResult;    // SHA3-256 hash (64 char hex)
-    secureDoc["hash_t"]           = hashingTime;   // hashing time (us) — untuk Level 9
-    secureDoc["integrity_valid"]  = true;          // selalu true di sisi pengirim
+    secureDoc["ml_class"]         = current_diagnosis;
+    secureDoc["hash"]             = hashResult;    
+    secureDoc["hash_t"]           = hashingTime;   
+    secureDoc["integrity_valid"]  = true;          
     secureDoc["cpu"]              = realCpuLoad;
     secureDoc["mem"]              = memoryUsagePercent;
     secureDoc["ts"]               = current_epoch_ms;
 
-    char jsonBuffer[512];
+    char jsonBuffer[768];
     serializeJson(secureDoc, jsonBuffer);
-    client.publish(mqtt_topic, jsonBuffer);
+    
+    // Tampilkan di Serial Monitor
+    Serial.print("Mengirim MQTT: ");
+    Serial.println(jsonBuffer);
 
-    Serial.printf("Hash: %s | Hash Time: %lu us\n",
-                  hashResult.substring(0, 16).c_str(), hashingTime);
+    client.publish(mqtt_topic, jsonBuffer);
   }
 
   delay(10);

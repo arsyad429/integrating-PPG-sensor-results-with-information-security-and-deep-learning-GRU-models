@@ -12,7 +12,7 @@
 #include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
-#include "model_data.h" // ⚠️ Pastikan file ini ada di folder yang sama dengan file .ino ini!
+#include "model_data.h" // ⚠️ Pastikan file ini ada di folder proyek!
 
 // --- Konfigurasi Jaringan & MQTT ---
 const char* ssid = "";       
@@ -26,7 +26,7 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 MAX30105 particleSensor;
 
-// --- Variabel Kalkulasi PPG ---
+// --- Variabel Kalkulasi PPG & HRV ---
 long lastBeat = 0; 
 int ibi = 0;       
 float beatsPerMinute = 0;
@@ -36,15 +36,15 @@ const byte RATE_SIZE = 4;
 byte rates[RATE_SIZE];
 byte rateSpot = 0;
 
-// --- Variabel HRV ---
 const byte HRV_SIZE = 10; 
 int ibi_array[HRV_SIZE];
 byte ibi_spot = 0;
 float hrv_sdnn = 0.0;
 
-// --- Variabel Pengatur Waktu ---
+// --- Variabel Pengatur Waktu & Bendera AI ---
 unsigned long lastPublishTime = 0;
 const int PUBLISH_INTERVAL = 200; 
+bool newBeatDetected = false; // Bendera agar AI tidak membaca duplikat data
 
 // =========================================================
 // VARIABEL GLOBAL TENSORFLOW LITE
@@ -54,18 +54,16 @@ tflite::MicroInterpreter* interpreter = nullptr;
 tflite::MicroErrorReporter micro_error_reporter;
 tflite::ErrorReporter* error_reporter = &micro_error_reporter;
 
-constexpr int kTensorArenaSize = 128 * 1024; // Alokasi 32KB RAM untuk model TFLite
+constexpr int kTensorArenaSize = 128 * 1024; // 128KB untuk GRU Model
 uint8_t tensor_arena[kTensorArenaSize];
 
-// Buffer untuk menampung input 20 timestep x 3 fitur (60 float)
 float input_buffer[60];
 int data_index = 0;
-
-// Variabel penyimpan hasil prediksi untuk dikirim ke MQTT
 String current_diagnosis = "Waiting for finger...";
 
 // =========================================================
-
+// FUNGSI HELPER
+// =========================================================
 void setup_wifi() {
   delay(10);
   Serial.print("Connecting to ");
@@ -80,13 +78,16 @@ void setup_wifi() {
 
 void reconnect() {
   while (!client.connected()) {
-    String clientId = "ESP32S3-PPG-";
+    String clientId = "ESP32S3-PPG-ML-";
     clientId += String(random(0, 1000));
     if (client.connect(clientId.c_str())) { } 
     else { delay(5000); }
   }
 }
 
+// =========================================================
+// SETUP
+// =========================================================
 void setup() {
   Serial.begin(115200);
   delay(3000); 
@@ -105,7 +106,7 @@ void setup() {
   client.setServer(mqtt_server, mqtt_port);
   client.setBufferSize(512); 
 
-  // --- INISIALISASI TENSORFLOW LITE ---
+  // Inisialisasi TFLite
   tfliteModel = tflite::GetModel(model_tflite);
   if (tfliteModel->version() != TFLITE_SCHEMA_VERSION) {
     Serial.println("ERROR: Skema TFLite tidak cocok!");
@@ -121,9 +122,12 @@ void setup() {
     Serial.println("ERROR: Gagal mengalokasikan memori Tensor Arena!");
     while (true);
   }
-  Serial.println("✅ TFLite Model berhasil dimuat dan siap digunakan!");
+  Serial.println("✅ TFLite Model berhasil dimuat!");
 }
 
+// =========================================================
+// MAIN LOOP
+// =========================================================
 void loop() {
   unsigned long loopStartMicros = micros(); 
 
@@ -137,10 +141,11 @@ void loop() {
   if (irValue < 50000) {
     sensorStatus = "No Finger Detected";
     beatAvg = 0; ibi = 0; hrv_sdnn = 0.0;
-    current_diagnosis = "Waiting for finger...";
-    data_index = 0; // Reset pengumpulan data ML jika jari dilepas
   } else {
+    // Mengecek detak jantung
     if (checkForBeat(irValue) == true) {
+      newBeatDetected = true; // BENDERA NYALA: Ada detak baru terdeteksi!
+
       unsigned long currentTime = millis();
       ibi = currentTime - lastBeat; 
       lastBeat = currentTime;
@@ -173,80 +178,80 @@ void loop() {
     }
   }
 
-  // --- Kalkulasi CPU Riil ---
   unsigned long processingTime = micros() - loopStartMicros; 
   float realCpuLoad = ((float)processingTime / (processingTime + 10000.0)) * 100.0;
 
-  // --- BLOK PUBLISH MQTT & INFERENSI ML (Setiap 200ms) ---
   if (millis() - lastPublishTime >= PUBLISH_INTERVAL) {
     lastPublishTime = millis();
 
-    // 1. PENGUMPULAN DATA UNTUK MODEL (Hanya jika jari terdeteksi)
-    if (irValue > 50000) {
+    // --- 1. PENGUMPULAN DATA & INFERENSI ML ---
+    // Syarat: Jari menempel DAN Detak sudah masuk akal (> 40 BPM)
+    if (irValue > 50000 && beatAvg > 40) {
       
-      // --- PARAMETER STANDARD SCALER DARI PYTHON ---
-      float mean_f1 = 0.7769376f;   float scale_f1 = 0.20464825f;
-      float mean_f2 = 82.99367422f; float scale_f2 = 23.88029078f;
-      float mean_f3 = 0.09135964f;  float scale_f3 = 0.08498789f;
-      
-      // Ambil data asli dan sesuaikan satuannya (ubah ms menjadi detik)
-      float feature1_raw = (float)ibi / 1000.0;     // Fitur 1: IBI (Detik)
-      float feature2_raw = (float)beatAvg;          // Fitur 2: BPM
-      float feature3_raw = hrv_sdnn / 1000.0;       // Fitur 3: HRV (Detik)
-
-      // Terapkan rumus StandardScaler: (Nilai Asli - Mean) / Scale
-      float feature1 = (feature1_raw - mean_f1) / scale_f1; 
-      float feature2 = (feature2_raw - mean_f2) / scale_f2;   
-      float feature3 = (feature3_raw - mean_f3) / scale_f3;      
-
-      if (data_index < 20) {
-        input_buffer[data_index * 3 + 0] = feature1;
-        input_buffer[data_index * 3 + 1] = feature2;
-        input_buffer[data_index * 3 + 2] = feature3;
-        data_index++;
+      // SYARAT TAMBAHAN: Eksekusi pengumpulan AI HANYA jika bendera detak baru menyala
+      if (newBeatDetected == true) {
+        newBeatDetected = false; // Langsung matikan agar tidak duplikat di loop berikutnya
         
-        if (data_index < 20) {
-           current_diagnosis = "Mengumpulkan Data (" + String(data_index) + "/20)...";
-        }
-      }
+        float mean_f1 = 0.7769376f;   float scale_f1 = 0.20464825f;
+        float mean_f2 = 82.99367422f; float scale_f2 = 23.88029078f;
+        float mean_f3 = 0.09135964f;  float scale_f3 = 0.08498789f;
+        
+        float feature1_raw = (float)ibi / 1000.0;     
+        float feature2_raw = (float)beatAvg;          
+        float feature3_raw = hrv_sdnn / 1000.0;       
 
-      // 2. EKSEKUSI MODEL JIKA 20 TIMESTEP SUDAH PENUH
+        float feature1 = (feature1_raw - mean_f1) / scale_f1; 
+        float feature2 = (feature2_raw - mean_f2) / scale_f2;   
+        float feature3 = (feature3_raw - mean_f3) / scale_f3;      
+
+        if (data_index < 20) {
+          input_buffer[data_index * 3 + 0] = feature1;
+          input_buffer[data_index * 3 + 1] = feature2;
+          input_buffer[data_index * 3 + 2] = feature3;
+          data_index++;
+          
+          if (data_index < 20) {
+             current_diagnosis = "Mengumpulkan Data (" + String(data_index) + "/20)...";
+          }
+        }
+      } // Akhir blok newBeatDetected
+
+      // Eksekusi GRU (Di luar dari bendera agar tetap terpanggil saat mencapai 20)
       if (data_index == 20) {
         TfLiteTensor* input = interpreter->input(0);
-        
-        // Salin data dari input_buffer ke tensor input TFLite
         for(int i = 0; i < 60; i++) {
           input->data.f[i] = input_buffer[i];
         }
 
-        // Jalankan inferensi GRU
         if (interpreter->Invoke() == kTfLiteOk) {
           TfLiteTensor* output = interpreter->output(0);
-          
           float p_normal      = output->data.f[0];
           float p_arrhythmia  = output->data.f[1];
           float p_tachycardia = output->data.f[2];
           float p_bradycardia = output->data.f[3];
 
-          // Cari nilai probabilitas tertinggi (Argmax)
           float max_prob = p_normal; 
           current_diagnosis = "Normal";
 
           if(p_arrhythmia > max_prob)  { max_prob = p_arrhythmia;  current_diagnosis = "Arrhythmia"; }
           if(p_tachycardia > max_prob) { max_prob = p_tachycardia; current_diagnosis = "Tachycardia"; }
           if(p_bradycardia > max_prob) { max_prob = p_bradycardia; current_diagnosis = "Bradycardia"; }
-
-          Serial.println("=> Prediksi Baru: " + current_diagnosis + " (" + String(max_prob*100) + "%)");
-        } else {
-          Serial.println("❌ ERROR: TFLite Invoke Gagal!");
         }
-        
-        // Reset kembali ke 0 untuk mengambil 20 data berikutnya
-        data_index = 0; 
+        data_index = 0; // Reset untuk gelombang observasi medis berikutnya
       }
+    } 
+    // Jika jari nempel tapi angka BPM masih 0 (sensor belum dapat ritme)
+    else if (irValue > 50000 && beatAvg <= 40) {
+        data_index = 0; 
+        current_diagnosis = "Menunggu detak stabil...";
+    } 
+    // Jari dilepas sepenuhnya
+    else {
+        data_index = 0;
+        current_diagnosis = "Waiting for finger...";
     }
 
-    // --- PENGIRIMAN DATA KE MQTT ---
+    // --- 2. PENYIAPAN METADATA & MQTT PUBLISH ---
     uint32_t freeHeap = ESP.getFreeHeap();
     uint32_t totalHeap = ESP.getHeapSize();
     float memoryUsagePercent = ((float)(totalHeap - freeHeap) / totalHeap) * 100.0;
@@ -268,8 +273,10 @@ void loop() {
 
     char jsonBuffer[512];
     serializeJson(doc, jsonBuffer);
-    Serial.print("Mengirim ke MQTT: ");
+    
+    Serial.print("Mengirim MQTT (Baseline): ");
     Serial.println(jsonBuffer);
+    
     client.publish(mqtt_topic, jsonBuffer);
   }
 

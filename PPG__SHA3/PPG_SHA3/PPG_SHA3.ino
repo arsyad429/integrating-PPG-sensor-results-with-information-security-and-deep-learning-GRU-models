@@ -1,6 +1,6 @@
 // ============================================================
 //  PPG_SHA3_ML.ino  —  Level 8 + Machine Learning
-//  Kombinasi Integritas SHA3-256 dan Klasifikasi TFLite (GRU)
+//  Kombinasi Integritas SHA3-256, TFLite (GRU), & Fix Sampling
 // ============================================================
 
 #include <WiFi.h>
@@ -48,9 +48,10 @@ int  ibi_array[HRV_SIZE];
 byte ibi_spot  = 0;
 float hrv_sdnn = 0.0;
 
-// --- Variabel Pengatur Waktu ---
+// --- Variabel Pengatur Waktu & Bendera AI ---
 unsigned long lastPublishTime = 0;
 const int PUBLISH_INTERVAL    = 200;
+bool newBeatDetected = false; // Bendera agar AI tidak membaca duplikat data
 
 // =========================================================
 // VARIABEL GLOBAL TENSORFLOW LITE
@@ -174,10 +175,11 @@ void loop() {
   if (irValue < 50000) {
     sensorStatus = "No Finger Detected";
     beatAvg = 0; ibi = 0; hrv_sdnn = 0.0;
-    current_diagnosis = "Waiting for finger...";
-    data_index = 0; 
   } else {
+    // Mengecek detak jantung
     if (checkForBeat(irValue) == true) {
+      newBeatDetected = true; // BENDERA NYALA: Ada detak baru terdeteksi!
+
       unsigned long currentTime = millis();
       ibi       = currentTime - lastBeat;
       lastBeat  = currentTime;
@@ -219,30 +221,37 @@ void loop() {
     lastPublishTime = millis();
 
     // 1. PENGUMPULAN DATA & INFERENSI ML 
-    if (irValue > 50000) {
-      float mean_f1 = 0.7769376f;   float scale_f1 = 0.20464825f;
-      float mean_f2 = 82.99367422f; float scale_f2 = 23.88029078f;
-      float mean_f3 = 0.09135964f;  float scale_f3 = 0.08498789f;
+    if (irValue > 50000 && beatAvg > 40) { 
       
-      float feature1_raw = (float)ibi / 1000.0;     
-      float feature2_raw = (float)beatAvg;          
-      float feature3_raw = hrv_sdnn / 1000.0;       
+      // Syarat Tambahan: Kumpulkan ke model ML HANYA jika bendera menyala
+      if (newBeatDetected == true) {
+        newBeatDetected = false; // Matikan bendera agar tidak duplikat
 
-      float feature1 = (feature1_raw - mean_f1) / scale_f1; 
-      float feature2 = (feature2_raw - mean_f2) / scale_f2;   
-      float feature3 = (feature3_raw - mean_f3) / scale_f3;      
-
-      if (data_index < 20) {
-        input_buffer[data_index * 3 + 0] = feature1;
-        input_buffer[data_index * 3 + 1] = feature2;
-        input_buffer[data_index * 3 + 2] = feature3;
-        data_index++;
+        float mean_f1 = 0.7769376f;   float scale_f1 = 0.20464825f;
+        float mean_f2 = 82.99367422f; float scale_f2 = 23.88029078f;
+        float mean_f3 = 0.09135964f;  float scale_f3 = 0.08498789f;
         
-        if (data_index < 20) {
-           current_diagnosis = "Mengumpulkan Data (" + String(data_index) + "/20)...";
-        }
-      }
+        float feature1_raw = (float)ibi / 1000.0;     
+        float feature2_raw = (float)beatAvg;          
+        float feature3_raw = hrv_sdnn / 1000.0;       
 
+        float feature1 = (feature1_raw - mean_f1) / scale_f1; 
+        float feature2 = (feature2_raw - mean_f2) / scale_f2;   
+        float feature3 = (feature3_raw - mean_f3) / scale_f3;      
+
+        if (data_index < 20) {
+          input_buffer[data_index * 3 + 0] = feature1;
+          input_buffer[data_index * 3 + 1] = feature2;
+          input_buffer[data_index * 3 + 2] = feature3;
+          data_index++;
+          
+          if (data_index < 20) {
+             current_diagnosis = "Mengumpulkan Data (" + String(data_index) + "/20)...";
+          }
+        }
+      } // Akhir blok newBeatDetected
+
+      // Eksekusi GRU (Di luar dari bendera agar tetap tereksekusi saat genap 20)
       if (data_index == 20) {
         TfLiteTensor* input = interpreter->input(0);
         for(int i = 0; i < 60; i++) {
@@ -265,8 +274,16 @@ void loop() {
           if(p_bradycardia > max_prob) { max_prob = p_bradycardia; current_diagnosis = "Bradycardia"; }
 
         } 
-        data_index = 0; 
+        data_index = 0; // Reset untuk siklus observasi berikutnya
       }
+    }
+    else if (irValue > 50000 && beatAvg <= 40) {
+        data_index = 0; 
+        current_diagnosis = "Menunggu detak stabil...";
+    } 
+    else {
+        data_index = 0;
+        current_diagnosis = "Waiting for finger...";
     }
 
     uint32_t freeHeap  = ESP.getFreeHeap();
@@ -322,7 +339,7 @@ void loop() {
     serializeJson(secureDoc, jsonBuffer);
     
     // Tampilkan di Serial Monitor
-    Serial.print("Mengirim MQTT: ");
+    Serial.print("Mengirim MQTT (SHA3): ");
     Serial.println(jsonBuffer);
 
     client.publish(mqtt_topic, jsonBuffer);

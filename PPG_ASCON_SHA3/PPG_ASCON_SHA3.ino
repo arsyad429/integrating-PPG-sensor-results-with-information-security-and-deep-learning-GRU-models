@@ -1,3 +1,8 @@
+// ============================================================
+//  PPG_SECURE_ULTIMATE.ino  —  Level 9 (ASCON + SHA3 + ML GRU)
+//  Kombinasi Enkripsi, Integritas, Edge AI & Fix Sampling
+// ============================================================
+
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -32,6 +37,8 @@ MAX30105 particleSensor;
 // --- Variabel Keamanan ASCON-128 & SHA3 ---
 Ascon128 ascon;
 SHA3_256 sha3; 
+
+// Kunci rahasia 16-byte (Wajib SAMA dengan di Python)
 byte secretKey[16] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F};
 byte nonce[16] = {0}; 
 
@@ -50,9 +57,10 @@ int ibi_array[HRV_SIZE];
 byte ibi_spot = 0;
 float hrv_sdnn = 0.0;
 
-// --- Variabel Pengatur Waktu ---
+// --- Variabel Pengatur Waktu & Bendera AI ---
 unsigned long lastPublishTime = 0;
 const int PUBLISH_INTERVAL = 200; 
+bool newBeatDetected = false; // Bendera agar AI tidak membaca duplikat data
 
 // =========================================================
 // VARIABEL GLOBAL TENSORFLOW LITE
@@ -121,7 +129,7 @@ void setup() {
   
   setup_wifi();
   client.setServer(mqtt_server, mqtt_port);
-  client.setBufferSize(1024); // Wajib 1KB karena payload sangat panjang (Ciphertext + Hash + ML)
+  client.setBufferSize(1024); // Wajib 1KB karena payload sangat panjang
 
   // Inisialisasi TFLite
   tfliteModel = tflite::GetModel(model_tflite);
@@ -154,13 +162,15 @@ void loop() {
   long irValue = particleSensor.getIR();
   String sensorStatus = "Good (100%)";
 
+  // --- CEK JARI & KALKULASI DATA VITAL ---
   if (irValue < 50000) {
     sensorStatus = "No Finger Detected";
     beatAvg = 0; ibi = 0; hrv_sdnn = 0.0;
-    current_diagnosis = "Waiting for finger...";
-    data_index = 0; 
   } else {
+    // Mengecek detak jantung
     if (checkForBeat(irValue) == true) {
+      newBeatDetected = true; // BENDERA NYALA: Ada detak baru terdeteksi!
+
       unsigned long currentTime = millis();
       ibi = currentTime - lastBeat; 
       lastBeat = currentTime;
@@ -200,30 +210,38 @@ void loop() {
     lastPublishTime = millis();
 
     // --- 1. PENGUMPULAN DATA & INFERENSI ML ---
-    if (irValue > 50000) {
-      float mean_f1 = 0.7769376f;   float scale_f1 = 0.20464825f;
-      float mean_f2 = 82.99367422f; float scale_f2 = 23.88029078f;
-      float mean_f3 = 0.09135964f;  float scale_f3 = 0.08498789f;
+    // Syarat: Jari menempel DAN Detak sudah masuk akal (> 40 BPM)
+    if (irValue > 50000 && beatAvg > 40) {
       
-      float feature1_raw = (float)ibi / 1000.0;     
-      float feature2_raw = (float)beatAvg;          
-      float feature3_raw = hrv_sdnn / 1000.0;       
-
-      float feature1 = (feature1_raw - mean_f1) / scale_f1; 
-      float feature2 = (feature2_raw - mean_f2) / scale_f2;   
-      float feature3 = (feature3_raw - mean_f3) / scale_f3;      
-
-      if (data_index < 20) {
-        input_buffer[data_index * 3 + 0] = feature1;
-        input_buffer[data_index * 3 + 1] = feature2;
-        input_buffer[data_index * 3 + 2] = feature3;
-        data_index++;
+      // SYARAT TAMBAHAN: Eksekusi pengumpulan AI HANYA jika bendera detak baru menyala
+      if (newBeatDetected == true) {
+        newBeatDetected = false; // Langsung matikan agar tidak duplikat di loop berikutnya
         
-        if (data_index < 20) {
-           current_diagnosis = "Mengumpulkan Data (" + String(data_index) + "/20)...";
-        }
-      }
+        float mean_f1 = 0.7769376f;   float scale_f1 = 0.20464825f;
+        float mean_f2 = 82.99367422f; float scale_f2 = 23.88029078f;
+        float mean_f3 = 0.09135964f;  float scale_f3 = 0.08498789f;
+        
+        float feature1_raw = (float)ibi / 1000.0;     
+        float feature2_raw = (float)beatAvg;          
+        float feature3_raw = hrv_sdnn / 1000.0;       
 
+        float feature1 = (feature1_raw - mean_f1) / scale_f1; 
+        float feature2 = (feature2_raw - mean_f2) / scale_f2;   
+        float feature3 = (feature3_raw - mean_f3) / scale_f3;      
+
+        if (data_index < 20) {
+          input_buffer[data_index * 3 + 0] = feature1;
+          input_buffer[data_index * 3 + 1] = feature2;
+          input_buffer[data_index * 3 + 2] = feature3;
+          data_index++;
+          
+          if (data_index < 20) {
+             current_diagnosis = "Mengumpulkan Data (" + String(data_index) + "/20)...";
+          }
+        }
+      } // Akhir blok newBeatDetected
+
+      // Eksekusi GRU (Di luar dari bendera agar tetap terpanggil saat mencapai 20)
       if (data_index == 20) {
         TfLiteTensor* input = interpreter->input(0);
         for(int i = 0; i < 60; i++) {
@@ -244,10 +262,21 @@ void loop() {
           if(p_tachycardia > max_prob) { max_prob = p_tachycardia; current_diagnosis = "Tachycardia"; }
           if(p_bradycardia > max_prob) { max_prob = p_bradycardia; current_diagnosis = "Bradycardia"; }
         }
-        data_index = 0; 
+        data_index = 0; // Reset untuk gelombang observasi medis berikutnya
       }
+    } 
+    // Jika jari nempel tapi angka BPM masih 0 (sensor belum dapat ritme)
+    else if (irValue > 50000 && beatAvg <= 40) {
+        data_index = 0; 
+        current_diagnosis = "Menunggu detak stabil...";
+    } 
+    // Jari dilepas sepenuhnya
+    else {
+        data_index = 0;
+        current_diagnosis = "Waiting for finger...";
     }
 
+    // --- 2. PENYIAPAN METADATA ---
     uint32_t freeHeap = ESP.getFreeHeap();
     uint32_t totalHeap = ESP.getHeapSize();
     float memoryUsagePercent = ((float)(totalHeap - freeHeap) / totalHeap) * 100.0;
@@ -256,26 +285,26 @@ void loop() {
     gettimeofday(&tv, NULL);
     unsigned long long current_epoch_ms = (unsigned long long)(tv.tv_sec) * 1000ULL + (unsigned long long)(tv.tv_usec) / 1000ULL;
 
-    // --- 2. Membuat Plaintext JSON Medis (Termasuk ML Class) ---
+    // --- 3. PEMBUATAN PLAINTEXT JSON MEDIS (Termasuk Prediksi ML) ---
     StaticJsonDocument<384> plainDoc; 
     plainDoc["ppg"] = irValue;     
     plainDoc["bpm"] = beatAvg;
     plainDoc["ibi"] = ibi;         
     plainDoc["hrv"] = hrv_sdnn;
     plainDoc["status"] = sensorStatus;
-    plainDoc["ml_class"] = current_diagnosis; // Prediksi dimasukkan ke sini!
+    plainDoc["ml_class"] = current_diagnosis; // Melindungi Klasifikasi Medis
     
     String plainTextStr;
     serializeJson(plainDoc, plainTextStr);
     int plainLen = plainTextStr.length();
 
-    // --- 3. Pembuatan Integritas Data via SHA3-256 ---
+    // --- 4. PEMBUATAN HASH SHA3-256 (Integritas) ---
     byte sha3Hash[32]; 
     sha3.reset();
     sha3.update((const uint8_t*)plainTextStr.c_str(), plainLen);
     sha3.finalize(sha3Hash, 32);
 
-    // --- 4. Proses Enkripsi ASCON-128 ---
+    // --- 5. PROSES ENKRIPSI ASCON-128 (Kerahasiaan) ---
     nonce[0]++; 
     if(nonce[0] == 0) nonce[1]++; 
 
@@ -293,11 +322,12 @@ void loop() {
     unsigned long encryptionTime = endEnc - startEnc;
     int encryptionOverhead = 16; 
     
+    // Gabungkan Ciphertext dan Tag untuk dikirim
     byte fullCipher[plainLen + 16];
     memcpy(fullCipher, ciphertext, plainLen);
     memcpy(fullCipher + plainLen, tag, 16);
     
-    // --- 5. Memasukkan ke Payload JSON Utama Jaringan ---
+    // --- 6. PEMBUNGKUSAN JSON FINAL & MQTT PUBLISH ---
     StaticJsonDocument<768> secureDoc; 
     secureDoc["ct"] = toHex(fullCipher, plainLen + 16);
     secureDoc["nonce"] = toHex(nonce, 16);
@@ -312,7 +342,7 @@ void loop() {
     serializeJson(secureDoc, jsonBuffer);
     client.publish(mqtt_topic, jsonBuffer);
     
-    // --- 6. Serial Print Debugging ---
+    // --- 7. SERIAL PRINT DEBUGGING ---
     Serial.printf("Vital  : BPM=%d | IBI=%dms | HRV=%.1fms | %s\n", 
                   beatAvg, ibi, hrv_sdnn, current_diagnosis.c_str());
                   
